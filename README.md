@@ -39,6 +39,10 @@ pi install git:github.com/<you>/pi-custom-providers
 - 编辑 metadata：context window、max output tokens、reasoning、input modalities、价格
 - **用 models.dev 补充缺失信息**：context window、max output tokens、reasoning、tool calling、modalities、pricing
 
+**模型列表是可滚动 + 可搜索的。** 从端点抓回来的模型会直接列出来（`＋` 未添加 / `✓` 已配置 / `⚠` 端点已不提供），输入关键字即可筛选，↑↓ 选择，Enter 添加单个，选完留在列表里继续挑。批量操作（添加全部 / 同步）也在同一列表底部。
+
+> 为什么不能直接用 Pi 的 `ctx.ui.select`：它把所有选项一次性渲染成行，而主屏模式的视口固定在底部——列表超过终端高度时标题会被顶出屏幕。中转站动辄返回几百个模型，所以这里用了一个基于 pi-tui `SelectList` 的自定义组件。该组件仅在 TUI 模式可用，RPC / print 模式会自动降级成选项菜单。
+
 **优先级**：中转站自己返回的 metadata → models.json 里已有的值 → models.dev 补缺。models.dev 只填**缺失**字段，不会覆盖你或中转站给出的数据。
 
 **API Key**：支持三种来源，同一时间只保留一个
@@ -58,6 +62,18 @@ pi install git:github.com/<you>/pi-custom-providers
 
 写入 `models.json` 时会先做结构校验，写入后立即让 Pi 重新加载；如果 Pi 拒绝该文件，会自动回滚到上一版内容。
 
+## 操作
+
+- **列表**：↑↓ 选择（或直接打字筛选）、Enter 确认、Esc 返回上一层
+- **向导**（添加 provider / 添加模型）：Enter 下一步、**Esc 返回上一步**；只有在第一步按 Esc 才取消整个流程
+- 「API key」那一步 **留空回车 = 跳过**
+
+每一步都会显示阶段，例如 `添加 provider  2/5 · 供应商名称（my-relay）`；子菜单带面包屑，例如 `my-relay › 模型（3 个）`。
+
+添加 provider 的五个步骤：`provider id → 供应商名称 → API 协议 → Base URL → API key`。供应商名称可以填中文，留空则用 id。
+
+改动会立即写进 `models.json`（带校验和回滚）并让 Pi 重新加载，不需要重启。
+
 ## 注意事项
 
 - **写回 `models.json` 会丢失文件里的 `//` 和 `/* */` 注释**（读取时是容忍的）。
@@ -69,10 +85,12 @@ pi install git:github.com/<you>/pi-custom-providers
 ## 开发
 
 ```bash
-npm install --offline   # 首次：typescript / @types/node / pi 类型
+npm install             # 首次：typescript / @types/node / pi 类型
 npm run typecheck
 pi -e ./src/index.ts
 ```
+
+运行时依赖为零：`@earendil-works/pi-coding-agent` 和 `@earendil-works/pi-tui` 都是 **peerDependencies**（由 Pi 宿主提供），只作为 devDependencies 装到本地供类型检查。
 
 改完源码在会话里用 `/reload`。
 

@@ -138,9 +138,9 @@ async function fetchCatalog(signal?: AbortSignal): Promise<ModelsDevCatalog> {
 		headers: { accept: "application/json" },
 		signal: combined,
 	});
-	if (!response.ok) throw new Error(`${MODELS_DEV_URL} returned HTTP ${response.status}`);
+	if (!response.ok) throw new Error(`${MODELS_DEV_URL} 返回 HTTP ${response.status}`);
 	const body: unknown = await response.json();
-	if (!isCatalog(body)) throw new Error(`${MODELS_DEV_URL} returned an unexpected payload`);
+	if (!isCatalog(body)) throw new Error(`${MODELS_DEV_URL} 返回了非预期的内容`);
 	return body;
 }
 
@@ -170,10 +170,10 @@ export async function loadCatalog(
 				fetchedAt: cached.fetchedAt,
 				source: "cache",
 				stale: true,
-				error: "PI_OFFLINE is set; using the cached models.dev catalog",
+				error: "已设置 PI_OFFLINE，使用本地缓存的 models.dev 目录",
 			};
 		}
-		return { catalog: {}, index: buildIndex({}), source: "cache", stale: true, error: "PI_OFFLINE is set and no cached catalog exists" };
+		return { catalog: {}, index: buildIndex({}), source: "cache", stale: true, error: "已设置 PI_OFFLINE，且没有可用的 models.dev 缓存" };
 	}
 
 	try {
@@ -190,10 +190,10 @@ export async function loadCatalog(
 				fetchedAt: cached.fetchedAt,
 				source: "cache",
 				stale: true,
-				error: `models.dev refresh failed (${message}); using cached data`,
+				error: `models.dev 刷新失败（${message}），改用本地缓存`,
 			};
 		}
-		return { catalog: {}, index: buildIndex({}), source: "cache", stale: true, error: `models.dev unavailable: ${message}` };
+		return { catalog: {}, index: buildIndex({}), source: "cache", stale: true, error: `models.dev 不可用：${message}` };
 	}
 }
 

@@ -108,7 +108,7 @@ function parseJson(raw: string, label: string): unknown {
 	try {
 		return JSON.parse(text);
 	} catch (error) {
-		throw new Error(`${label} is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+		throw new Error(`${label} 不是合法 JSON：${error instanceof Error ? error.message : String(error)}`);
 	}
 }
 
@@ -187,9 +187,9 @@ export async function readModelsFile(paths: Paths): Promise<ModelsFile> {
 	const raw = await readText(paths.modelsPath);
 	if (raw === undefined || raw.trim() === "") return { providers: {} };
 	const parsed = parseJson(raw, "models.json");
-	if (!isObject(parsed)) throw new Error("models.json must contain a JSON object");
+	if (!isObject(parsed)) throw new Error("models.json 必须是一个 JSON 对象");
 	if (parsed.providers === undefined) return { providers: {}, ...parsed } as ModelsFile;
-	if (!isObject(parsed.providers)) throw new Error('models.json: "providers" must be an object');
+	if (!isObject(parsed.providers)) throw new Error('models.json：“providers” 必须是对象');
 	return parsed as ModelsFile;
 }
 
@@ -201,46 +201,46 @@ export async function readModelsFileRaw(paths: Paths): Promise<string | undefine
 export function validateModelsFile(file: ModelsFile): string[] {
 	const errors: string[] = [];
 	const providers = file.providers;
-	if (!isObject(providers)) return ['"providers" must be an object'];
+	if (!isObject(providers)) return ['"providers" 必须是对象'];
 	for (const [id, rawProvider] of Object.entries(providers)) {
 		if (!isObject(rawProvider)) {
-			errors.push(`providers.${id}: must be an object`);
+			errors.push(`providers.${id}：必须是对象`);
 			continue;
 		}
 		if (rawProvider.api !== undefined && typeof rawProvider.api !== "string") {
-			errors.push(`providers.${id}.api: must be a string`);
+			errors.push(`providers.${id}.api：必须是字符串`);
 		}
 		if (rawProvider.baseUrl !== undefined && typeof rawProvider.baseUrl !== "string") {
-			errors.push(`providers.${id}.baseUrl: must be a string`);
+			errors.push(`providers.${id}.baseUrl：必须是字符串`);
 		}
 		const models = rawProvider.models;
 		if (models === undefined) continue;
 		if (!Array.isArray(models)) {
-			errors.push(`providers.${id}.models: must be an array`);
+			errors.push(`providers.${id}.models：必须是数组`);
 			continue;
 		}
 		const seen = new Set<string>();
 		for (const [index, rawModel] of models.entries()) {
 			const where = `providers.${id}.models[${index}]`;
 			if (!isObject(rawModel) || typeof rawModel.id !== "string" || rawModel.id.length === 0) {
-				errors.push(`${where}.id: required and must be a non-empty string`);
+				errors.push(`${where}.id：必填，且必须是非空字符串`);
 				continue;
 			}
-			if (seen.has(rawModel.id)) errors.push(`${where}: duplicate model id "${rawModel.id}"`);
+			if (seen.has(rawModel.id)) errors.push(`${where}：重复的模型 id "${rawModel.id}"`);
 			seen.add(rawModel.id);
 			const api = rawModel.api ?? rawProvider.api;
 			const baseUrl = rawModel.baseUrl ?? rawProvider.baseUrl;
 			if (typeof api !== "string" || api.length === 0) {
-				errors.push(`${where} (${rawModel.id}): needs "api" at model or provider level`);
+				errors.push(`${where} (${rawModel.id})：需要在模型或 provider 层级指定 "api"`);
 			}
 			if (typeof baseUrl !== "string" || baseUrl.length === 0) {
-				errors.push(`${where} (${rawModel.id}): needs "baseUrl" at model or provider level`);
+				errors.push(`${where} (${rawModel.id})：需要在模型或 provider 层级指定 "baseUrl"`);
 			}
 			for (const field of ["contextWindow", "maxTokens"] as const) {
 				const value = rawModel[field];
 				if (value === undefined) continue;
 				if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
-					errors.push(`${where}.${field}: must be a positive number`);
+					errors.push(`${where}.${field}：必须是正数`);
 				}
 			}
 		}
@@ -255,7 +255,7 @@ export function validateModelsFile(file: ModelsFile): string[] {
  */
 export async function saveModelsFile(paths: Paths, registry: RegistryLike, file: ModelsFile): Promise<void> {
 	const errors = validateModelsFile(file);
-	if (errors.length > 0) throw new Error(`models.json validation failed:\n${errors.join("\n")}`);
+	if (errors.length > 0) throw new Error(`models.json 校验未通过：\n${errors.join("\n")}`);
 
 	const previousRaw = await readModelsFileRaw(paths);
 	const previousError = registry.getError();
@@ -268,7 +268,7 @@ export async function saveModelsFile(paths: Paths, registry: RegistryLike, file:
 		if (previousRaw === undefined) await rm(paths.modelsPath, { force: true });
 		else await atomicWrite(paths.modelsPath, previousRaw);
 		await registry.refresh({ allowNetwork: false });
-		throw new Error(`Pi rejected the saved models.json; changes were rolled back.\n${error}`);
+		throw new Error(`Pi 拒绝了保存的 models.json，已回滚到修改前的内容。\n${error}`);
 	}
 }
 
@@ -324,7 +324,7 @@ export async function getStoredCredentialKind(paths: Paths, providerId: string):
 export async function setStoredApiKey(paths: Paths, providerId: string, key: string): Promise<void> {
 	const raw = await readText(paths.authPath);
 	const parsed = raw === undefined || raw.trim() === "" ? {} : parseJson(raw, "auth.json");
-	if (!isObject(parsed)) throw new Error("auth.json must contain a JSON object");
+	if (!isObject(parsed)) throw new Error("auth.json 必须是一个 JSON 对象");
 	const existing = parsed[providerId];
 	const entry: Record<string, unknown> = isObject(existing) ? { ...existing } : {};
 	entry.type = "api_key";
@@ -364,8 +364,8 @@ export function escapeConfigValue(value: string): string {
 }
 
 export function describeApiKeySource(apiKey: string | undefined): string {
-	if (apiKey === undefined || apiKey === "") return "none";
-	if (apiKey.startsWith("!")) return "command";
-	if (/^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/.test(apiKey)) return `env ${apiKey}`;
-	return "literal in models.json";
+	if (apiKey === undefined || apiKey === "") return "无";
+	if (apiKey.startsWith("!")) return "命令";
+	if (/^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/.test(apiKey)) return `环境变量 ${apiKey}`;
+	return "models.json 中的字面量";
 }

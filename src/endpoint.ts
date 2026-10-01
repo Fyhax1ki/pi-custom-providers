@@ -127,7 +127,7 @@ export async function discoverModels(
 	signal?: AbortSignal,
 ): Promise<DiscoveryResult> {
 	const baseUrl = typeof provider.baseUrl === "string" ? provider.baseUrl.trim() : "";
-	if (baseUrl === "") throw new Error(`Provider "${providerId}" has no baseUrl`);
+	if (baseUrl === "") throw new Error(`Provider "${providerId}" 没有配置 baseUrl`);
 
 	const auth = await ctx.modelRegistry.getApiKeyAndHeaders({
 		provider: providerId,
@@ -158,12 +158,12 @@ export async function discoverModels(
 		const body: unknown = await response.json().catch(() => undefined);
 		const models = extractModels(body);
 		if (models.length === 0) {
-			problems.push(`${url} → HTTP 200 but no recognizable model list`);
+			problems.push(`${url} → HTTP 200，但没有可识别的模型列表`);
 			continue;
 		}
 		return { models, url };
 	}
 
 	const detail = problems.join("\n");
-	throw new Error(`Could not list models for "${providerId}".${note ? `\nAuth: ${note}` : ""}${detail ? `\n${detail}` : ""}`);
+	throw new Error(`无法获取 "${providerId}" 的模型列表。${note ? `\n认证：${note}` : ""}${detail ? `\n${detail}` : ""}`);
 }

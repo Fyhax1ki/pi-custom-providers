@@ -11,7 +11,7 @@ import { runManager } from "./manager.ts";
 
 export default function providerManager(pi: ExtensionAPI): void {
 	pi.registerCommand("providers", {
-		description: "Manage custom providers, relay endpoints, API keys and models (models.json)",
+		description: "管理自定义 provider、中转站、API key 和模型（models.json）",
 		handler: async (_args, ctx) => {
 			await runManager(ctx);
 		},
