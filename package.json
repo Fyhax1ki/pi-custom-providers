@@ -10,6 +10,7 @@
     "models.json"
   ],
   "license": "MIT",
+  "repository": "github:Fyhax1ki/pi-custom-providers",
   "pi": {
     "extensions": [
       "./src/index.ts"

@@ -7,14 +7,20 @@ Pi Coding Agent 扩展：**Provider Manager**。用来管理第三方 Provider �
 ## 安装
 
 ```bash
-# 单次会话试用
-pi -e /path/to/pi-custom-providers
+# 从 npm 安装（推荐）
+pi install npm:pi-custom-providers
 
-# 作为本地包安装
-pi install /path/to/pi-custom-providers
+# 从 git 安装（Pi 会自己 clone 一份）
+pi install git:github.com/Fyhax1ki/pi-custom-providers
 
-# 从 git 安装
-pi install git:github.com/<you>/pi-custom-providers
+# 指定用户级或项目级：默认用户级（所有项目生效），加 -l 只写到当前项目的 .pi/settings.json
+pi install npm:pi-custom-providers -l
+```
+
+临时试用单次会话，不改配置：
+
+```bash
+pi -e npm:pi-custom-providers
 ```
 
 然后在 Pi 里运行：
@@ -22,6 +28,8 @@ pi install git:github.com/<you>/pi-custom-providers
 ```
 /providers
 ```
+
+卸载：`pi remove npm:pi-custom-providers`。
 
 ## 功能
 
