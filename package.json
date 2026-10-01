@@ -1,0 +1,33 @@
+{
+  "name": "pi-custom-providers",
+  "version": "0.1.0",
+  "description": "Pi extension that manages third-party providers and relay endpoints through models.json",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "provider",
+    "models.json"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.99.1",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
