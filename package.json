@@ -1,5 +1,5 @@
 {
-  "name": "pi-custom-providers",
+  "name": "@fyhax1ki/pi-custom-providers",
   "version": "0.1.0",
   "description": "Pi extension that manages third-party providers and relay endpoints through models.json",
   "type": "module",
