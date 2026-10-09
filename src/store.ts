@@ -9,8 +9,9 @@
  *   calling, family, release dates, ...) that models.json has no field for.
  */
 
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { rm } from "node:fs/promises";
+import { atomicWrite, readText, withFileLock } from "./file-io.ts";
+import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { ManagedModel, ManagedProvider, ManagerMeta, ModelsFile } from "./types.ts";
 
@@ -112,27 +113,6 @@ function parseJson(raw: string, label: string): unknown {
 	}
 }
 
-async function readText(path: string): Promise<string | undefined> {
-	try {
-		return await readFile(path, "utf8");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-		throw error;
-	}
-}
-
-async function atomicWrite(path: string, content: string, mode?: number): Promise<void> {
-	await mkdir(dirname(path), { recursive: true });
-	const temp = `${path}.${process.pid}.${Date.now()}.tmp`;
-	await writeFile(temp, content, mode === undefined ? "utf8" : { encoding: "utf8", mode });
-	try {
-		await rename(temp, path);
-	} catch (error) {
-		await rm(temp, { force: true });
-		throw error;
-	}
-}
-
 // ---------------------------------------------------------------------------
 // models.json
 // ---------------------------------------------------------------------------
@@ -151,7 +131,7 @@ const MODEL_KEY_ORDER = ["id", "name", "api", "baseUrl", "reasoning", "input", "
 const COST_KEY_ORDER = ["input", "output", "cacheRead", "cacheWrite"] as const;
 
 function orderKeys(record: Record<string, unknown>, order: readonly string[]): Record<string, unknown> {
-	const out: Record<string, unknown> = {};
+	const out: Record<string, unknown> = Object.create(null);
 	for (const key of order) {
 		if (record[key] !== undefined) out[key] = record[key];
 	}
@@ -163,7 +143,7 @@ function orderKeys(record: Record<string, unknown>, order: readonly string[]): R
 
 /** Stable key order so saved files produce readable diffs. */
 export function serializeModelsFile(file: ModelsFile): string {
-	const providers: Record<string, unknown> = {};
+	const providers: Record<string, unknown> = Object.create(null);
 	for (const [id, provider] of Object.entries(file.providers)) {
 		const raw = provider as Record<string, unknown>;
 		const models = Array.isArray(raw.models)
@@ -176,20 +156,22 @@ export function serializeModelsFile(file: ModelsFile): string {
 		const withModels = models === undefined ? raw : { ...raw, models };
 		providers[id] = orderKeys(withModels, PROVIDER_KEY_ORDER);
 	}
-	const rest: Record<string, unknown> = {};
+	const rest: Record<string, unknown> = Object.create(null);
 	for (const [key, value] of Object.entries(file)) {
 		if (key !== "providers" && value !== undefined) rest[key] = value;
 	}
 	return `${JSON.stringify({ providers, ...rest }, null, 2)}\n`;
 }
 
+const revisions = new WeakMap<object, string | undefined>();
+
 export async function readModelsFile(paths: Paths): Promise<ModelsFile> {
 	const raw = await readText(paths.modelsPath);
-	if (raw === undefined || raw.trim() === "") return { providers: {} };
-	const parsed = parseJson(raw, "models.json");
+	const parsed = raw === undefined || raw.trim() === "" ? { providers: {} } : parseJson(raw, "models.json");
 	if (!isObject(parsed)) throw new Error("models.json 必须是一个 JSON 对象");
-	if (parsed.providers === undefined) return { providers: {}, ...parsed } as ModelsFile;
-	if (!isObject(parsed.providers)) throw new Error('models.json：“providers” 必须是对象');
+	if (parsed.providers === undefined) parsed.providers = {};
+	if (!isObject(parsed.providers)) throw new Error("models.json 的 providers 必须是对象");
+	revisions.set(parsed, raw);
 	return parsed as ModelsFile;
 }
 
@@ -236,11 +218,20 @@ export function validateModelsFile(file: ModelsFile): string[] {
 			if (typeof baseUrl !== "string" || baseUrl.length === 0) {
 				errors.push(`${where} (${rawModel.id})：需要在模型或 provider 层级指定 "baseUrl"`);
 			}
+			if (rawModel.reasoning !== undefined && typeof rawModel.reasoning !== "boolean") errors.push(`${where}.reasoning：必须是布尔值`);
+			if (rawModel.input !== undefined && (!Array.isArray(rawModel.input) || rawModel.input.some(value => value !== "text" && value !== "image"))) errors.push(`${where}.input：仅支持 text 和 image`);
+			if (rawModel.cost !== undefined) {
+				if (!isObject(rawModel.cost)) errors.push(`${where}.cost：必须是对象`);
+				else for (const key of ["input", "output", "cacheRead", "cacheWrite"]) {
+					const value = rawModel.cost[key];
+					if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value) || value < 0)) errors.push(`${where}.cost.${key}：必须是非负数`);
+				}
+			}
 			for (const field of ["contextWindow", "maxTokens"] as const) {
 				const value = rawModel[field];
 				if (value === undefined) continue;
-				if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
-					errors.push(`${where}.${field}：必须是正数`);
+				if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+					errors.push(`${where}.${field}：必须是正整数`);
 				}
 			}
 		}
@@ -253,23 +244,62 @@ export function validateModelsFile(file: ModelsFile): string[] {
  * schema, provider that cannot be composed) the previous content is restored so
  * the user never loses a working configuration.
  */
-export async function saveModelsFile(paths: Paths, registry: RegistryLike, file: ModelsFile): Promise<void> {
+export interface SaveOptions {
+	credential?: { providerId: string; key?: string };
+	meta?: ManagerMeta;
+}
+
+type Undo = () => Promise<void>;
+
+/** A failed rollback must never overwrite a newer edit made by another program. */
+async function restoreFile(path: string, previous: string | undefined, written: string): Promise<void> {
+	if (await readText(path) !== written) throw new Error(`${path} 已被其他会话修改，未覆盖该文件`);
+	if (previous === undefined) await rm(path, { force: true });
+	else await atomicWrite(path, previous);
+}
+
+export async function saveModelsFile(paths: Paths, registry: RegistryLike, file: ModelsFile, options: SaveOptions = {}): Promise<void> {
 	const errors = validateModelsFile(file);
 	if (errors.length > 0) throw new Error(`models.json 校验未通过：\n${errors.join("\n")}`);
-
-	const previousRaw = await readModelsFileRaw(paths);
-	const previousError = registry.getError();
-
-	await atomicWrite(paths.modelsPath, serializeModelsFile(file));
-	await registry.refresh({ allowNetwork: false });
-
-	const error = registry.getError();
-	if (error !== undefined && error !== previousError) {
-		if (previousRaw === undefined) await rm(paths.modelsPath, { force: true });
-		else await atomicWrite(paths.modelsPath, previousRaw);
-		await registry.refresh({ allowNetwork: false });
-		throw new Error(`Pi 拒绝了保存的 models.json，已回滚到修改前的内容。\n${error}`);
-	}
+	await withFileLock(paths.modelsPath, async assertOwned => {
+		const previous = await readText(paths.modelsPath);
+		if (revisions.has(file) && previous !== revisions.get(file)) {
+			throw new Error("配置已被其他会话修改，请重新打开菜单后重试");
+		}
+		const next = serializeModelsFile(file);
+		const undo: Undo[] = [];
+		try {
+			if (options.credential) undo.push(await changeCredential(paths, options.credential));
+			if (options.meta) {
+				const meta = options.meta;
+				await withFileLock(paths.metaPath, async () => {
+					const oldMeta = await readText(paths.metaPath);
+					if (revisions.has(meta) && oldMeta !== revisions.get(meta)) throw new Error("模型元数据已被其他会话修改，请重试");
+					const newMeta = `${JSON.stringify(meta, null, 2)}\n`;
+					await atomicWrite(paths.metaPath, newMeta);
+					undo.push(() => withFileLock(paths.metaPath, () => restoreFile(paths.metaPath, oldMeta, newMeta)));
+				});
+			}
+			await assertOwned();
+			if (await readText(paths.modelsPath) !== previous) throw new Error("配置在保存期间已被其他程序修改，请重试");
+			await atomicWrite(paths.modelsPath, next);
+			undo.push(() => restoreFile(paths.modelsPath, previous, next));
+			await registry.refresh({ allowNetwork: false });
+			await assertOwned();
+			const error = registry.getError();
+			if (error !== undefined) throw new Error(error);
+			revisions.set(file, next);
+			if (options.meta) revisions.set(options.meta, `${JSON.stringify(options.meta, null, 2)}\n`);
+		} catch (error) {
+			const failures: string[] = [];
+			for (const restore of undo.reverse()) {
+				try { await restore(); } catch (rollbackError) { failures.push(String(rollbackError)); }
+			}
+			try { await registry.refresh({ allowNetwork: false }); }
+			catch (reloadError) { failures.push(`重新加载失败：${String(reloadError)}`); }
+			throw new Error(`保存失败，${failures.length ? "回滚或重新加载未完全成功" : "已恢复修改前的配置"}。\n${String(error)}${failures.length ? `\n${failures.join("\n")}` : ""}`);
+		}
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -278,14 +308,20 @@ export async function saveModelsFile(paths: Paths, registry: RegistryLike, file:
 
 export async function readManagerMeta(paths: Paths): Promise<ManagerMeta> {
 	const raw = await readText(paths.metaPath);
-	if (raw === undefined || raw.trim() === "") return { version: 1, models: {} };
-	const parsed = parseJson(raw, "provider-manager.json");
-	if (!isObject(parsed) || !isObject(parsed.models)) return { version: 1, models: {} };
-	return { version: 1, models: parsed.models as ManagerMeta["models"] };
+	const parsed = raw === undefined || raw.trim() === "" ? { version: 1, models: {} } : parseJson(raw, "provider-manager.json");
+	if (!isObject(parsed) || !isObject(parsed.models)) throw new Error("provider-manager.json 格式无效");
+	const meta: ManagerMeta = { version: 1, models: parsed.models as ManagerMeta["models"] };
+	revisions.set(meta, raw);
+	return meta;
 }
 
 export async function writeManagerMeta(paths: Paths, meta: ManagerMeta): Promise<void> {
-	await atomicWrite(paths.metaPath, `${JSON.stringify(meta, null, 2)}\n`);
+	await withFileLock(paths.metaPath, async () => {
+		if (revisions.has(meta) && await readText(paths.metaPath) !== revisions.get(meta)) throw new Error("模型元数据已被其他会话修改，请重试");
+		const next = `${JSON.stringify(meta, null, 2)}\n`;
+		await atomicWrite(paths.metaPath, next);
+		revisions.set(meta, next);
+	});
 }
 
 export function renameManagerMeta(meta: ManagerMeta, fromKey: string, toKey: string): void {
@@ -317,31 +353,42 @@ export async function getStoredCredentialKind(paths: Paths, providerId: string):
 	return entry.type === "oauth" ? "oauth" : "api_key";
 }
 
-/**
- * Store an API key the way `/login` does. Existing entries and credential
- * fields such as `env` are preserved.
- */
-export async function setStoredApiKey(paths: Paths, providerId: string, key: string): Promise<void> {
-	const raw = await readText(paths.authPath);
+function parseAuth(raw: string | undefined): Record<string, unknown> {
 	const parsed = raw === undefined || raw.trim() === "" ? {} : parseJson(raw, "auth.json");
 	if (!isObject(parsed)) throw new Error("auth.json 必须是一个 JSON 对象");
-	const existing = parsed[providerId];
-	const entry: Record<string, unknown> = isObject(existing) ? { ...existing } : {};
-	entry.type = "api_key";
-	entry.key = key;
-	parsed[providerId] = entry;
-	const existed = raw !== undefined;
-	await atomicWrite(paths.authPath, `${JSON.stringify(parsed, null, 2)}\n`, existed ? undefined : 0o600);
+	return Object.assign(Object.create(null), parsed);
+}
+
+/** Hold the auth lock only while editing; Pi also acquires it during refresh. */
+async function changeCredential(paths: Paths, change: NonNullable<SaveOptions["credential"]>): Promise<Undo> {
+	return withFileLock(paths.authPath, async () => {
+		const parsed = parseAuth(await readText(paths.authPath));
+		const previous = parsed[change.providerId];
+		const next = change.key === undefined ? undefined : {
+			...(isObject(previous) && previous.type === "api_key" ? previous : {}),
+			type: "api_key", key: change.key,
+		};
+		if (next === undefined) delete parsed[change.providerId];
+		else parsed[change.providerId] = next;
+		await atomicWrite(paths.authPath, `${JSON.stringify(parsed, null, 2)}\n`, 0o600);
+		return () => withFileLock(paths.authPath, async () => {
+			const latest = parseAuth(await readText(paths.authPath));
+			if (JSON.stringify(latest[change.providerId]) !== JSON.stringify(next)) throw new Error("凭据已被其他会话修改，未覆盖新凭据");
+			if (previous === undefined) delete latest[change.providerId];
+			else latest[change.providerId] = previous;
+			await atomicWrite(paths.authPath, `${JSON.stringify(latest, null, 2)}\n`, 0o600);
+		});
+	});
+}
+
+export async function setStoredApiKey(paths: Paths, providerId: string, key: string): Promise<void> {
+	await changeCredential(paths, { providerId, key });
 }
 
 export async function deleteStoredCredential(paths: Paths, providerId: string): Promise<boolean> {
-	const raw = await readText(paths.authPath);
-	if (raw === undefined || raw.trim() === "") return false;
-	const parsed = parseJson(raw, "auth.json");
-	if (!isObject(parsed) || !(providerId in parsed)) return false;
-	delete parsed[providerId];
-	await atomicWrite(paths.authPath, `${JSON.stringify(parsed, null, 2)}\n`);
-	return true;
+	const existed = await getStoredCredentialKind(paths, providerId) !== undefined;
+	await changeCredential(paths, { providerId });
+	return existed;
 }
 
 // ---------------------------------------------------------------------------

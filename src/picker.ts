@@ -10,7 +10,6 @@
  */
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Container, Input, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
 
 export interface PickItem {
@@ -22,14 +21,20 @@ export interface PickItem {
 	search?: string;
 }
 
+export interface PickState {
+	query?: string;
+	selected?: string;
+}
+
 export interface PickOptions {
+	state?: PickState;
 	/** 一屏最多显示多少行，其余靠滚动。 */
 	maxVisible?: number;
 	footer?: string;
 	placeholder?: string;
 }
 
-const DEFAULT_FOOTER = "输入关键字筛选 · ↑↓ 选择 · Enter 确认 · Esc 取消";
+const DEFAULT_FOOTER = "输入关键字筛选，上下键 选择，Enter 确认，Esc 取消";
 
 /** 只在 `ctx.mode === "tui"` 时调用。返回选中的 value；Esc 取消返回 undefined。 */
 export async function pickList(
@@ -39,9 +44,12 @@ export async function pickList(
 	options: PickOptions = {},
 ): Promise<string | undefined> {
 	if (items.length === 0) return undefined;
-	const maxVisible = options.maxVisible ?? 14;
+	const state = options.state ?? {};
+	const searchable = items.map(item => ({ item, text: (item.search ?? `${item.label} ${item.description ?? ""}`).toLowerCase() }));
 
 	const result = await ctx.ui.custom<string | null>((tui, theme, keybindings, done) => {
+		const visibleRows = () => Math.max(1, Math.min(options.maxVisible ?? 14, tui.terminal.rows - 8));
+		let maxVisible = visibleRows();
 		const listTheme = {
 			selectedPrefix: (text: string) => theme.fg("accent", text),
 			selectedText: (text: string) => theme.fg("accent", text),
@@ -51,11 +59,11 @@ export async function pickList(
 		};
 
 		const container = new Container();
-		container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
 		container.addChild(new Text(theme.fg("accent", theme.bold(title))));
 
-		const filter = new Input({ prompt: `${theme.fg("muted", "筛选 ")}`, placeholder: options.placeholder ?? "输入关键字…" });
+		const filter = new Input({ prompt: `${theme.fg("muted", "筛选 ")}`, placeholder: options.placeholder ?? "输入关键字" });
 		filter.focused = true;
+		filter.setValue(state.query ?? "");
 		container.addChild(filter);
 
 		const listArea = new Container();
@@ -65,11 +73,12 @@ export async function pickList(
 		const shown: PickItem[] = [];
 
 		const rebuild = () => {
-			const query = filter.getValue().trim().toLowerCase();
+			state.query = filter.getValue();
+			const query = state.query.trim().toLowerCase();
+			const selected = list?.getSelectedItem()?.value ?? state.selected;
 			shown.length = 0;
-			for (const item of items) {
-				const haystack = (item.search ?? `${item.label} ${item.description ?? ""}`).toLowerCase();
-				if (query === "" || haystack.includes(query)) shown.push(item);
+			for (const { item, text } of searchable) {
+				if (query === "" || text.includes(query)) shown.push(item);
 			}
 			listArea.clear();
 			if (shown.length === 0) {
@@ -84,7 +93,9 @@ export async function pickList(
 				maxVisible,
 				listTheme,
 			);
-			next.onSelect = (item) => done(item.value);
+			next.setSelectedIndex(Math.max(0, shown.findIndex(item => item.value === selected)));
+			next.onSelectionChange = item => { state.selected = item.value; };
+			next.onSelect = (item) => { state.selected = item.value; done(item.value); };
 			next.onCancel = () => done(null);
 			listArea.addChild(next);
 			list = next;
@@ -92,10 +103,12 @@ export async function pickList(
 		rebuild();
 
 		container.addChild(new Text(theme.fg("dim", options.footer ?? DEFAULT_FOOTER)));
-		container.addChild(new DynamicBorder((text: string) => theme.fg("accent", text)));
 
 		return {
-			render: (width: number) => container.render(width),
+			render: (width: number) => {
+				if (maxVisible !== visibleRows()) { maxVisible = visibleRows(); rebuild(); }
+				return container.render(width);
+			},
 			invalidate: () => container.invalidate(),
 			handleInput: (data: string) => {
 				// 导航键交给列表；其余按键进入筛选框。这样就是「边打边筛」的手感。

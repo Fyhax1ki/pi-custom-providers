@@ -1,3 +1,9 @@
 node_modules/
 *.log
 .DS_Store
+
+.test-tmp-*/
+
+# Project-local npm cache and publishing credentials
+.npm-cache/
+.npm-publish.npmrc

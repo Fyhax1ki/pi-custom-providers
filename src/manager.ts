@@ -7,12 +7,13 @@
  */
 
 import type { ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { discoverModels, type DiscoveredModel } from "./endpoint.ts";
+import { discoverModels, type DiscoveredModel, type DiscoveryResult } from "./endpoint.ts";
 import { enrichFromModelsDev, loadCatalog, lookupModel, type CatalogHandle } from "./modelsdev.ts";
-import { canPick, pickList, type PickItem } from "./picker.ts";
+import { mergeDiscoveredModels } from "./model-operations.ts";
+import { withProgress } from "./progress.ts";
+import { canPick, pickList, type PickItem, type PickState } from "./picker.ts";
 import { runWizard, type WizardStep } from "./wizard.ts";
 import {
-	deleteStoredCredential,
 	describeApiKeySource,
 	dropManagerMetaPrefix,
 	escapeConfigValue,
@@ -24,13 +25,12 @@ import {
 	readManagerMeta,
 	readModelsFile,
 	saveModelsFile,
-	setStoredApiKey,
-	writeManagerMeta,
+	type SaveOptions,
 	type Paths,
 } from "./store.ts";
-import { API_PROTOCOLS, CANCELLED, isCancelled, modelMetaKey, type ManagedModel, type ManagedProvider, type ModelInput, type ModelMeta, type ModelsFile } from "./types.ts";
+import { API_PROTOCOLS, CANCELLED, setModelNumber, isCancelled, modelMetaKey, type ManagedModel, type ManagedProvider, type ModelInput, type ModelMeta, type ModelsFile } from "./types.ts";
 
-const BACK = "← 返回";
+const BACK = "返回";
 const STATUS_KEY = "provider-manager";
 
 type Answer<T> = T | typeof CANCELLED;
@@ -65,19 +65,19 @@ type NumberAnswer = { kind: "value"; value: number } | { kind: "clear" } | { kin
 
 async function askNumber(ctx: ExtensionContext, title: string, current: number | undefined): Promise<NumberAnswer> {
 	const shown = current === undefined ? "（未设置）" : String(current);
-	const raw = await ctx.ui.input(`${title} — 当前：${shown}`, "数字，留空表示不设置");
+	const raw = await ctx.ui.input(`${title}：当前：${shown}`, "数字，留空表示不设置");
 	if (raw === undefined) return { kind: "cancel" };
 	const text = raw.trim();
 	if (text === "") return { kind: "clear" };
 	const value = Number(text);
-	if (Number.isFinite(value) && value > 0) return { kind: "value", value };
-	ctx.ui.notify(`不是正数：${text}`, "warning");
+	if (Number.isSafeInteger(value) && value > 0) return { kind: "value", value };
+	ctx.ui.notify(`不是正整数：${text}`, "warning");
 	return askNumber(ctx, title, current);
 }
 
 async function askYesNo(ctx: ExtensionContext, title: string, current?: boolean): Promise<Answer<boolean>> {
 	const shown = current === undefined ? "未设置" : current ? "是" : "否";
-	const answer = await choose(ctx, `${title} — 当前：${shown}`, [
+	const answer = await choose(ctx, `${title}：当前：${shown}`, [
 		{ label: "是", value: true },
 		{ label: "否", value: false },
 	]);
@@ -109,12 +109,13 @@ async function editJsonObject(
 }
 
 function notifyError(ctx: ExtensionContext, error: unknown): void {
+	if (error instanceof Error && error.name === "AbortError") { ctx.ui.notify("操作已取消", "info"); return; }
 	const message = error instanceof Error ? error.message : String(error);
 	ctx.ui.notify(truncate(message, 600), "error");
 }
 
 function truncate(value: string, max: number): string {
-	return value.length > max ? `${value.slice(0, max)}…` : value;
+	return value.length > max ? `${value.slice(0, max)}` : value;
 }
 
 function formatTokens(value: number | undefined): string {
@@ -161,7 +162,7 @@ function providerLabel(ctx: ExtensionContext, provider: ManagedProvider, provide
 	const api = typeof provider.api === "string" ? provider.api : "未设 api";
 	const count = providerModels(provider).length;
 	const name = typeof provider.name === "string" && provider.name !== "" ? provider.name : providerId;
-	return `${providerId} — ${name} [${api}] ${count} 个模型 · ${authLabel(ctx, providerId)}`;
+	return `${providerId}：${name} [${api}] ${count} 个模型，${authLabel(ctx, providerId)}`;
 }
 
 function modelLabel(model: ManagedModel, meta: { toolCall?: boolean } | undefined): string {
@@ -171,8 +172,8 @@ function modelLabel(model: ManagedModel, meta: { toolCall?: boolean } | undefine
 	const input = Array.isArray(model.input) ? model.input : ["text"];
 	if (input.includes("image")) parts.push("+图片");
 	if (meta?.toolCall === false) parts.push("无工具调用");
-	if (model.contextWindow === undefined || model.maxTokens === undefined) parts.push("⚠ 信息不全");
-	return parts.join("  ·  ");
+	if (model.contextWindow === undefined || model.maxTokens === undefined) parts.push("提示：信息不全");
+	return parts.join(" ， ");
 }
 
 function costSummary(model: ManagedModel): string {
@@ -187,8 +188,8 @@ function modelDescription(model: ManagedModel, meta: { toolCall?: boolean } | un
 	const input = Array.isArray(model.input) ? model.input : ["text"];
 	if (input.includes("image")) parts.push("+图片");
 	if (meta?.toolCall === false) parts.push("无工具调用");
-	if (model.contextWindow === undefined || model.maxTokens === undefined) parts.push("⚠ 信息不全");
-	return parts.join(" · ");
+	if (model.contextWindow === undefined || model.maxTokens === undefined) parts.push("提示：信息不全");
+	return parts.join("，");
 }
 
 /** 从端点拿到的模型在列表里的副标题。 */
@@ -200,7 +201,7 @@ function discoveredDescription(model: DiscoveredModel, isConfigured: boolean): s
 	if (model.maxTokens !== undefined) limits.push(`输出 ${formatTokens(model.maxTokens)}`);
 	if (limits.length > 0) parts.push(limits.join(" / "));
 	parts.push(isConfigured ? "已配置" : "未添加");
-	return parts.join(" · ");
+	return parts.join("，");
 }
 
 // ---------------------------------------------------------------------------
@@ -211,9 +212,9 @@ async function reloadModels(paths: Paths): Promise<ModelsFile> {
 	return readModelsFile(paths);
 }
 
-async function save(ctx: ExtensionContext, paths: Paths, file: ModelsFile): Promise<boolean> {
+async function save(ctx: ExtensionContext, paths: Paths, file: ModelsFile, options: SaveOptions = {}): Promise<boolean> {
 	try {
-		await saveModelsFile(paths, ctx.modelRegistry, file);
+		await saveModelsFile(paths, ctx.modelRegistry, file, options);
 		return true;
 	} catch (error) {
 		notifyError(ctx, error);
@@ -227,20 +228,12 @@ async function requireProvider(paths: Paths, providerId: string): Promise<Manage
 }
 
 async function withCatalog(ctx: ExtensionContext, paths: Paths, refresh: boolean, label = "models.dev"): Promise<CatalogHandle> {
-	ctx.ui.setStatus(STATUS_KEY, refresh ? `${label} · 正在刷新…` : `${label} · 正在读取…`);
+	ctx.ui.setStatus(STATUS_KEY, refresh ? `${label}，正在刷新` : `${label}，正在读取`);
 	try {
-		return await loadCatalog(paths, { refresh });
+		return await withProgress(ctx, label, signal => loadCatalog(paths, { refresh, signal }));
 	} finally {
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 	}
-}
-
-function toManagedModel(discovered: DiscoveredModel): ManagedModel {
-	const model: ManagedModel = { id: discovered.id };
-	if (discovered.name !== undefined) model.name = discovered.name;
-	if (discovered.contextWindow !== undefined) model.contextWindow = discovered.contextWindow;
-	if (discovered.maxTokens !== undefined) model.maxTokens = discovered.maxTokens;
-	return model;
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +253,7 @@ export async function runManager(ctx: ExtensionCommandContext): Promise<void> {
 		return;
 	}
 	await ctx.waitForIdle();
-	await mainMenu(ctx, paths);
+	try { await mainMenu(ctx, paths); } catch (error) { notifyError(ctx, error); }
 }
 
 async function mainMenu(ctx: ExtensionContext, paths: Paths): Promise<void> {
@@ -275,17 +268,17 @@ async function mainMenu(ctx: ExtensionContext, paths: Paths): Promise<void> {
 		const ids = Object.keys(file.providers);
 		const choices: Choice<string>[] = ids.map((id) => {
 			const provider = file.providers[id];
-			return { label: isObject(provider) ? providerLabel(ctx, provider as ManagedProvider, id) : `${id}（无效条目）`, value: id };
+			return { label: isObject(provider) ? providerLabel(ctx, provider as ManagedProvider, id) : `${id}（无效条目）`, value: `provider:${id}` };
 		});
-		choices.push({ label: "＋ 添加 provider…", value: "+" });
+		choices.push({ label: "添加 provider", value: "+" });
 		choices.push({
-			label: "✦ 用 models.dev 补全缺失信息（所有 provider）…",
+			label: "用 models.dev 补全缺失信息（所有 provider）",
 			value: "~enrich",
 			disabled: ids.length === 0,
 		});
-		choices.push({ label: "✕ 关闭", value: "close" });
+		choices.push({ label: "关闭", value: "close" });
 
-		const answer = await choose(ctx, `Provider 管理器 — models.json 中有 ${ids.length} 个 provider`, choices);
+		const answer = await choose(ctx, `Provider 管理器：models.json 中有 ${ids.length} 个 provider`, choices);
 		if (isCancelled(answer) || answer === "close") return;
 		if (answer === "+") {
 			await addProvider(ctx, paths);
@@ -295,7 +288,7 @@ async function mainMenu(ctx: ExtensionContext, paths: Paths): Promise<void> {
 			await enrichAll(ctx, paths, false);
 			continue;
 		}
-		await providerMenu(ctx, paths, answer);
+		await providerMenu(ctx, paths, answer.slice("provider:".length));
 	}
 }
 
@@ -311,17 +304,17 @@ async function providerMenu(ctx: ExtensionContext, paths: Paths, providerId: str
 		const models = providerModels(provider);
 		const headers = isObject(provider.headers) ? Object.keys(provider.headers).length : 0;
 
-		const answer = await choose<string>(ctx, `Provider "${providerId}" · key：${authLabel(ctx, providerId)}`, [
-			{ label: "测试连接…", value: "test", disabled: models.length === 0 },
-			{ label: "从端点获取模型列表…", value: "fetch" },
-			{ label: `模型（${models.length}）…`, value: "models" },
-			{ label: "用 models.dev 补全缺失信息…", value: "enrich", disabled: models.length === 0 },
-			{ label: `API key — ${authLabel(ctx, providerId)}…`, value: "key" },
+		const answer = await choose<string>(ctx, `Provider "${providerId}"，key：${authLabel(ctx, providerId)}`, [
+			{ label: "测试连接", value: "test", disabled: models.length === 0 },
+			{ label: "从端点获取模型列表", value: "fetch" },
+			{ label: `模型（${models.length}）`, value: "models" },
+			{ label: "用 models.dev 补全缺失信息", value: "enrich", disabled: models.length === 0 },
+			{ label: `API key：${authLabel(ctx, providerId)}`, value: "key" },
 			{ label: `修改供应商名称（${provider.name ?? "未设置"}）`, value: "name" },
 			{ label: `修改 Base URL（${provider.baseUrl ?? "未设置"}）`, value: "baseUrl" },
 			{ label: `API 协议（${provider.api ?? "未设置"}）`, value: "api" },
-			{ label: `附加 Headers（${headers}）…`, value: "headers" },
-			{ label: "删除 provider…", value: "delete" },
+			{ label: `附加 Headers（${headers}）`, value: "headers" },
+			{ label: "删除 provider", value: "delete" },
 			{ label: BACK, value: "back" },
 		]);
 
@@ -438,16 +431,14 @@ async function deleteProvider(ctx: ExtensionContext, paths: Paths, providerId: s
 	const stored = await getStoredCredentialKind(paths, providerId);
 	const confirmed = await ctx.ui.confirm(
 		`删除 provider "${providerId}"？`,
-		`会把它从 models.json 中移除${stored === undefined ? "" : "，并删除 auth.json 里存的 API key"}。`,
+		`会把它从 models.json 中移除${stored === undefined ? "" : "，并删除 auth.json 中的登录凭据"}。`,
 	);
 	if (!confirmed) return false;
 	const file = await reloadModels(paths);
 	delete file.providers[providerId];
-	if (!(await save(ctx, paths, file))) return false;
-	if (stored !== undefined) await deleteStoredCredential(paths, providerId);
 	const meta = await readManagerMeta(paths);
 	dropManagerMetaPrefix(meta, providerId);
-	await writeManagerMeta(paths, meta);
+	if (!(await save(ctx, paths, file, { meta, ...(stored === undefined ? {} : { credential: { providerId } }) }))) return false;
 	ctx.ui.notify(`已删除 provider "${providerId}"`, "info");
 	return true;
 }
@@ -472,7 +463,7 @@ async function addProvider(ctx: ExtensionContext, paths: Paths): Promise<void> {
 			label: "provider id",
 			run: async (c, d, progress) => {
 				while (true) {
-					const answer = await askText(c, `${progress} · provider id`, "例如 my-relay（供应商名称默认同 id）");
+					const answer = await askText(c, `${progress}，provider id`, "例如 my-relay（供应商名称默认同 id）");
 					if (isCancelled(answer)) return false;
 					if (answer === "") {
 						c.ui.notify("provider id 不能为空", "warning");
@@ -483,7 +474,7 @@ async function addProvider(ctx: ExtensionContext, paths: Paths): Promise<void> {
 						continue;
 					}
 					const current = await reloadModels(paths);
-					if (current.providers[answer] !== undefined) {
+					if (Object.hasOwn(current.providers, answer)) {
 						c.ui.notify(`models.json 中已存在 "${answer}"`, "warning");
 						continue;
 					}
@@ -502,7 +493,7 @@ async function addProvider(ctx: ExtensionContext, paths: Paths): Promise<void> {
 		{
 			label: "供应商名称",
 			run: async (c, d, progress) => {
-				const answer = await askText(c, `${progress} · 供应商名称（${d.id}）`, d.name === "" ? `${d.id}（留空即用 id）` : d.name);
+				const answer = await askText(c, `${progress}，供应商名称（${d.id}）`, d.name === "" ? `${d.id}（留空即用 id）` : d.name);
 				if (isCancelled(answer)) return false;
 				d.name = answer === "" ? d.id : answer;
 				return true;
@@ -513,7 +504,7 @@ async function addProvider(ctx: ExtensionContext, paths: Paths): Promise<void> {
 			run: async (c, d, progress) => {
 				const protocol = await choose(
 					c,
-					`${progress} · API 协议（${d.id}）`,
+					`${progress}，API 协议（${d.id}）`,
 					API_PROTOCOLS.map((value) => ({ label: value, value: value as string })),
 				);
 				if (isCancelled(protocol)) return false;
@@ -525,7 +516,7 @@ async function addProvider(ctx: ExtensionContext, paths: Paths): Promise<void> {
 			label: "Base URL",
 			run: async (c, d, progress) => {
 				while (true) {
-					const answer = await askText(c, `${progress} · Base URL（${d.id}）`, d.baseUrl === "" ? "https://api.example.com/v1" : d.baseUrl);
+					const answer = await askText(c, `${progress}，Base URL（${d.id}）`, d.baseUrl === "" ? "https://api.example.com/v1" : d.baseUrl);
 					if (isCancelled(answer)) return false;
 					if (answer === "") {
 						c.ui.notify("Base URL 不能为空", "warning");
@@ -533,6 +524,7 @@ async function addProvider(ctx: ExtensionContext, paths: Paths): Promise<void> {
 					}
 					try {
 						const parsed = new URL(answer);
+						if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("仅支持 HTTP/HTTPS");
 						d.baseUrl = `${parsed.protocol}//${parsed.host}${parsed.pathname}`.replace(/\/+$/, "");
 						return true;
 					} catch {
@@ -545,7 +537,7 @@ async function addProvider(ctx: ExtensionContext, paths: Paths): Promise<void> {
 		{
 			label: "API key（留空跳过）",
 			run: async (c, d, progress) => {
-				const key = await askText(c, `${progress} · API key（${d.id}，留空跳过）`, "sk-…（存入 auth.json）");
+				const key = await askText(c, `${progress}，API key（${d.id}，留空跳过）`, "sk-（存入 auth.json）");
 				// Esc 在这里也是「退回上一步」，不是跳过：跳过请直接回车
 				if (isCancelled(key)) return false;
 				d.key = key;
@@ -559,25 +551,14 @@ async function addProvider(ctx: ExtensionContext, paths: Paths): Promise<void> {
 
 	// 前三步都过了才落盘，避免在 models.json 留半成品
 	const file = await reloadModels(paths);
+	if (Object.hasOwn(file.providers, result.id)) { ctx.ui.notify("该 provider 已被其他会话添加，请重试", "warning"); return; }
 	file.providers[result.id] = {
 		name: result.name === "" ? result.id : result.name,
 		baseUrl: result.baseUrl,
 		api: result.protocol,
 	};
-	if (!(await save(ctx, paths, file))) return;
-
-	let keySaved = false;
-	if (result.key !== "") {
-		try {
-			await setStoredApiKey(paths, result.id, result.key);
-			const afterKey = await reloadModels(paths);
-			const provider = findProvider(afterKey, result.id);
-			if (provider !== undefined) await clearInlineKey(provider);
-			keySaved = await save(ctx, paths, afterKey);
-		} catch (error) {
-			notifyError(ctx, error);
-		}
-	}
+	const keySaved = result.key !== "";
+	if (!(await save(ctx, paths, file, keySaved ? { credential: { providerId: result.id, key: result.key } } : {}))) return;
 
 	ctx.ui.notify(
 		`已添加 provider "${result.id}"（供应商名称：${result.name === "" ? result.id : result.name}）${keySaved ? "，key 已存入 auth.json" : "（未配置 key）"}`,
@@ -614,7 +595,7 @@ async function apiKeyMenu(ctx: ExtensionContext, paths: Paths, providerId: strin
 
 	const answer = await choose<string>(
 		ctx,
-		`${providerId} › API key · auth.json：${stored === undefined ? "无" : "已存 key"} · models.json：${describeApiKeySource(inline)}`,
+		`${providerId} / API key，auth.json：${stored === undefined ? "无" : "已存 key"}，models.json：${describeApiKeySource(inline)}`,
 		[
 			{ label: "输入 key 并存到 auth.json（推荐）", value: "store" },
 			{ label: "输入 key 直接写进 models.json", value: "literal" },
@@ -626,30 +607,25 @@ async function apiKeyMenu(ctx: ExtensionContext, paths: Paths, providerId: strin
 	);
 
 	if (isCancelled(answer) || answer === "back") return;
+	if (stored === "oauth" && !await ctx.ui.confirm("替换 OAuth 登录凭据？", "这会移除该 provider 的 OAuth 登录状态，改用所选的 API key 来源。")) return;
 	try {
 		switch (answer) {
 			case "store": {
-				const key = await askText(ctx, `${providerId} › API key（存到 auth.json）`, "sk-…");
+				const key = await askText(ctx, `${providerId} / API key（存到 auth.json）`, "输入 API key");
 				if (isCancelled(key) || key === "") return;
-				await setStoredApiKey(paths, providerId, key);
 				await clearInlineKey(provider);
-				const saved = await save(ctx, paths, file);
-				ctx.ui.notify(
-					`已保存${saved ? "" : "（但 provider 未能重新加载）"} — key 已存进 auth.json，models.json 的 apiKey 已清空以保证只有一个来源`,
-					saved ? "info" : "warning",
-				);
+				if (await save(ctx, paths, file, { credential: { providerId, key } })) ctx.ui.notify("API key 已存入 auth.json，models.json 中的 key 已清除", "info");
 				return;
 			}
 			case "literal": {
-				const key = await askText(ctx, `${providerId} › 字面量 API key（写进 models.json）`, "sk-…");
+				const key = await askText(ctx, `${providerId} / 字面量 API key（写进 models.json）`, "输入 API key");
 				if (isCancelled(key) || key === "") return;
 				provider.apiKey = escapeConfigValue(key);
-				if (stored !== undefined) await deleteStoredCredential(paths, providerId);
-				if (await save(ctx, paths, file)) ctx.ui.notify("models.json 的 apiKey 已设置，auth.json 里存的 key 已删除", "info");
+				if (await save(ctx, paths, file, { credential: { providerId } })) ctx.ui.notify("models.json 的 apiKey 已设置，auth.json 里存的 key 已删除", "info");
 				return;
 			}
 			case "env": {
-				const raw = await askText(ctx, `${providerId} › 环境变量名`, "MY_RELAY_API_KEY");
+				const raw = await askText(ctx, `${providerId} / 环境变量名`, "MY_RELAY_API_KEY");
 				if (isCancelled(raw) || raw === "") return;
 				const reference = normalizeEnvReference(raw);
 				if (reference === undefined) {
@@ -657,24 +633,21 @@ async function apiKeyMenu(ctx: ExtensionContext, paths: Paths, providerId: strin
 					return;
 				}
 				provider.apiKey = reference;
-				if (stored !== undefined) await deleteStoredCredential(paths, providerId);
-				if (await save(ctx, paths, file)) ctx.ui.notify(`models.json 的 apiKey 已设为 ${reference}，auth.json 里存的 key 已删除`, "info");
+				if (await save(ctx, paths, file, { credential: { providerId } })) ctx.ui.notify(`models.json 的 apiKey 已设为 ${reference}，auth.json 里存的 key 已删除`, "info");
 				return;
 			}
 			case "command": {
-				const raw = await askText(ctx, `${providerId} › 输出 API key 的命令（取 stdout）`, "security find-generic-password -ws 'relay'");
+				const raw = await askText(ctx, `${providerId} / 输出 API key 的命令（取 stdout）`, "security find-generic-password -ws 'relay'");
 				if (isCancelled(raw) || raw === "") return;
 				provider.apiKey = raw.startsWith("!") ? raw : `!${raw}`;
-				if (stored !== undefined) await deleteStoredCredential(paths, providerId);
-				if (await save(ctx, paths, file)) ctx.ui.notify("models.json 的 apiKey 已设为命令，auth.json 里存的 key 已删除", "info");
+				if (await save(ctx, paths, file, { credential: { providerId } })) ctx.ui.notify("models.json 的 apiKey 已设为命令，auth.json 里存的 key 已删除", "info");
 				return;
 			}
 			case "clear": {
 				const confirmed = await ctx.ui.confirm(`清除 ${providerId} 的 key 信息？`, "会删除 auth.json 里的条目和 models.json 的 apiKey。");
 				if (!confirmed) return;
-				if (stored !== undefined) await deleteStoredCredential(paths, providerId);
 				await clearInlineKey(provider);
-				if (await save(ctx, paths, file)) ctx.ui.notify("API key 已清除", "info");
+				if (await save(ctx, paths, file, { credential: { providerId } })) ctx.ui.notify("API key 已清除", "info");
 				return;
 			}
 		}
@@ -688,6 +661,7 @@ async function apiKeyMenu(ctx: ExtensionContext, paths: Paths, providerId: strin
 // ---------------------------------------------------------------------------
 
 async function modelsMenu(ctx: ExtensionContext, paths: Paths, providerId: string): Promise<void> {
+	const pickerState: PickState = {};
 	while (true) {
 		const file = await reloadModels(paths);
 		const provider = findProvider(file, providerId);
@@ -702,14 +676,15 @@ async function modelsMenu(ctx: ExtensionContext, paths: Paths, providerId: strin
 				label: model.id,
 				description: modelDescription(model, meta.models[modelMetaKey(providerId, model.id)]),
 			}));
-			items.push({ value: "::add", label: "＋ 手动添加模型", description: "输入模型 id，然后从 models.dev 补全信息" });
-			items.push({ value: "::fetch", label: "↻ 从端点获取模型列表", description: "请求端点的 /models" });
+			items.push({ value: "::add", label: "手动添加模型", description: "输入模型 id，然后从 models.dev 补全信息" });
+			items.push({ value: "::fetch", label: "从端点获取模型列表", description: "请求端点的 /models" });
 			if (models.length > 0) {
-				items.push({ value: "::enrich", label: "✦ 用 models.dev 补全缺失信息", description: `检查全部 ${models.length} 个模型` });
+				items.push({ value: "::enrich", label: "用 models.dev 补全缺失信息", description: `检查全部 ${models.length} 个模型` });
 			}
-			const picked = await pickList(ctx, `${providerId} › 模型（${models.length} 个）`, items, {
+			const picked = await pickList(ctx, `${providerId} / 模型（${models.length} 个）`, items, {
 				maxVisible: 16,
-				footer: "输入关键字筛选 · ↑↓ 选择 · Enter 进入 · Esc 返回",
+				state: pickerState,
+				footer: "输入关键字筛选，上下键 选择，Enter 进入，Esc 返回",
 			});
 			if (picked === undefined) return;
 			try {
@@ -728,16 +703,16 @@ async function modelsMenu(ctx: ExtensionContext, paths: Paths, providerId: strin
 			label: modelLabel(model, meta.models[modelMetaKey(providerId, model.id)]),
 			value: `model:${model.id}`,
 		}));
-		choices.push({ label: "＋ 手动添加模型…", value: "+" });
-		choices.push({ label: "↻ 从端点获取模型列表…", value: "~fetch" });
+		choices.push({ label: "手动添加模型", value: "+" });
+		choices.push({ label: "从端点获取模型列表", value: "~fetch" });
 		choices.push({
-			label: "✦ 用 models.dev 补全缺失信息…",
+			label: "用 models.dev 补全缺失信息",
 			value: "~enrich",
 			disabled: models.length === 0,
 		});
 		choices.push({ label: BACK, value: "back" });
 
-		const answer = await choose(ctx, `${providerId} › 模型（${models.length} 个）`, choices);
+		const answer = await choose(ctx, `${providerId} / 模型（${models.length} 个）`, choices);
 		if (isCancelled(answer) || answer === "back") return;
 		try {
 			if (answer === "+") await addModelManually(ctx, paths, providerId);
@@ -761,18 +736,18 @@ async function modelMenu(ctx: ExtensionContext, paths: Paths, providerId: string
 
 		const answer = await choose<string>(
 			ctx,
-			`${providerId} › ${modelId}${meta?.toolCall === false ? " · ⚠ 不支持工具调用" : ""}`,
+			`${providerId} / ${modelId}${meta?.toolCall === false ? "（不支持工具调用）" : ""}`,
 			[
 				{ label: `修改显示名（${model.name ?? modelId}）`, value: "name" },
 				{ label: `上下文窗口（${model.contextWindow ?? "未设置"}）`, value: "context" },
 				{ label: `最大输出 tokens（${model.maxTokens ?? "未设置"}）`, value: "maxTokens" },
 				{ label: `推理（${model.reasoning === true ? "是" : "否"}）`, value: "reasoning" },
 				{ label: `输入模态（${input}）`, value: "input" },
-				{ label: `价格 / 1M tokens（${costSummary(model)}）`, value: "cost" },
+				{ label: `价格 / 1M tokens（${costSummary(model)}${meta?.source === "models.dev" ? "，目录参考" : ""}）`, value: "cost" },
 				{ label: `API 覆盖（${model.api ?? "跟随 provider"}）`, value: "api" },
 				{ label: `Base URL 覆盖（${model.baseUrl ?? "跟随 provider"}）`, value: "baseUrl" },
-				{ label: "用 models.dev 补全信息…", value: "enrich" },
-				{ label: "删除模型…", value: "delete" },
+				{ label: "用 models.dev 补全信息", value: "enrich" },
+				{ label: "删除模型", value: "delete" },
 				{ label: BACK, value: "back" },
 			],
 		);
@@ -791,8 +766,7 @@ async function modelMenu(ctx: ExtensionContext, paths: Paths, providerId: string
 				case "maxTokens": {
 					const value = await askNumber(ctx, answer === "context" ? "上下文窗口（tokens）" : "最大输出 tokens", answer === "context" ? model.contextWindow : model.maxTokens);
 					if (value.kind === "cancel") break;
-					if (value.kind === "clear") delete model[answer];
-					else model[answer] = value.value;
+					setModelNumber(model, answer === "context" ? "contextWindow" : "maxTokens", value.kind === "clear" ? undefined : value.value);
 					if (await save(ctx, paths, file)) ctx.ui.notify("模型信息已更新", "info");
 					break;
 				}
@@ -815,7 +789,7 @@ async function modelMenu(ctx: ExtensionContext, paths: Paths, providerId: string
 					break;
 				}
 				case "cost": {
-					const value = await editJsonObject(ctx, "价格 / 1M tokens — 键：input, output, cacheRead, cacheWrite", isObject(model.cost) ? model.cost : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+					const value = await editJsonObject(ctx, "价格 / 1M tokens：键：input, output, cacheRead, cacheWrite", isObject(model.cost) ? model.cost : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 					if (isCancelled(value)) break;
 					if (value === undefined) delete model.cost;
 					else model.cost = value;
@@ -838,7 +812,11 @@ async function modelMenu(ctx: ExtensionContext, paths: Paths, providerId: string
 					const value = await askText(ctx, "模型 Base URL 覆盖", model.baseUrl ?? provider.baseUrl ?? "");
 					if (isCancelled(value)) break;
 					if (value === "") delete model.baseUrl;
-					else model.baseUrl = value.replace(/\/+$/, "");
+					else {
+						const url = new URL(value);
+						if (!["http:", "https:"].includes(url.protocol)) throw new Error("Base URL 必须使用 http 或 https");
+						model.baseUrl = value.replace(/\/+$/, "");
+					}
 					if (await save(ctx, paths, file)) ctx.ui.notify("模型 Base URL 已更新", "info");
 					break;
 				}
@@ -852,10 +830,9 @@ async function modelMenu(ctx: ExtensionContext, paths: Paths, providerId: string
 					const freshProvider = findProvider(fresh, providerId);
 					if (freshProvider === undefined) return;
 					freshProvider.models = providerModels(freshProvider).filter((entry) => entry.id !== modelId);
-					if (!(await save(ctx, paths, fresh))) break;
 					const meta2 = await readManagerMeta(paths);
 					delete meta2.models[modelMetaKey(providerId, modelId)];
-					await writeManagerMeta(paths, meta2);
+					if (!(await save(ctx, paths, fresh, { meta: meta2 }))) break;
 					ctx.ui.notify(`已删除模型 "${modelId}"`, "info");
 					return;
 				}
@@ -883,32 +860,27 @@ async function fillModelFromModelsDev(
 	const model = provider === undefined ? undefined : findModel(provider, modelId);
 	if (provider === undefined || model === undefined) return;
 
-	const handle = catalog ?? (await withCatalog(ctx, paths, false, `补全信息 · 读取 models.dev`));
+	const handle = catalog ?? (await withCatalog(ctx, paths, false, `补全信息，读取 models.dev`));
 	if (handle.error !== undefined) ctx.ui.notify(handle.error, "warning");
 	const lookup = lookupModel(handle.index, providerId, modelId);
 	if (lookup === undefined) {
-		ctx.ui.notify(`models.dev 中找不到 "${modelId}" 的信息`, "warning");
+		ctx.ui.notify(`models.dev 中找不到唯一匹配的 "${modelId}" 的信息`, "warning");
 		return;
 	}
 	const enrichment = enrichFromModelsDev(model, lookup, overwrite);
-	if (enrichment.filled.length === 0) {
-		ctx.ui.notify(`"${modelId}" 的信息已经完整，无需补全`, "info");
-		return;
-	}
 	Object.assign(model, enrichment.patch);
-	if (!(await save(ctx, paths, file))) return;
 	const meta = await readManagerMeta(paths);
 	const key = modelMetaKey(providerId, modelId);
 	meta.models[key] = { ...meta.models[key], ...enrichment.meta };
-	await writeManagerMeta(paths, meta);
-	ctx.ui.notify(`已用 models.dev（${lookup.providerId}）补全 ${enrichment.filled.join(", ")}：${modelId}`, "info");
+	if (!(await save(ctx, paths, file, { meta }))) return;
+	ctx.ui.notify(`已用 models.dev（${lookup.providerId}）补全 ${enrichment.filled.length ? enrichment.filled.join(", ") : "模型元数据"}：${modelId}`, "info");
 }
 
 async function enrichProvider(ctx: ExtensionContext, paths: Paths, providerId: string): Promise<void> {
 	const file = await reloadModels(paths);
 	const provider = findProvider(file, providerId);
 	if (provider === undefined) return;
-	const handle = await withCatalog(ctx, paths, false, `${providerId} › 补全信息 · 读取 models.dev`);
+	const handle = await withCatalog(ctx, paths, false, `${providerId} / 补全信息，读取 models.dev`);
 	if (handle.error !== undefined) ctx.ui.notify(handle.error, "warning");
 
 	const meta = await readManagerMeta(paths);
@@ -921,24 +893,22 @@ async function enrichProvider(ctx: ExtensionContext, paths: Paths, providerId: s
 			continue;
 		}
 		const enrichment = enrichFromModelsDev(model, lookup, false);
-		if (enrichment.filled.length === 0) continue;
 		Object.assign(model, enrichment.patch);
 		const key = modelMetaKey(providerId, model.id);
 		meta.models[key] = { ...meta.models[key], ...enrichment.meta };
 		filled++;
 	}
 	if (filled === 0) {
-		ctx.ui.notify(`"${providerId}" 没有需要补全的信息（${missed} 个模型在 models.dev 中找不到）`, "info");
+		ctx.ui.notify(`"${providerId}" 没有需要补全的信息（${missed} 个模型在 models.dev 中没有唯一匹配唯一匹配的）`, "info");
 		return;
 	}
-	if (!(await save(ctx, paths, file))) return;
-	await writeManagerMeta(paths, meta);
-	ctx.ui.notify(`已补全 ${filled} 个模型（provider "${providerId}"），来源 models.dev${missed > 0 ? `；${missed} 个未找到` : ""}`, "info");
+	if (!(await save(ctx, paths, file, { meta }))) return;
+	ctx.ui.notify(`已补全 ${filled} 个模型（provider "${providerId}"），来源 models.dev（参考信息）${missed > 0 ? `；${missed} 个未找到` : ""}`, "info");
 }
 
 async function enrichAll(ctx: ExtensionContext, paths: Paths, refresh: boolean): Promise<void> {
 	const file = await reloadModels(paths);
-	const handle = await withCatalog(ctx, paths, refresh, "补全信息（全部 provider） · 读取 models.dev");
+	const handle = await withCatalog(ctx, paths, refresh, "补全信息（全部 provider），读取 models.dev");
 	if (handle.error !== undefined) ctx.ui.notify(handle.error, "warning");
 
 	const meta = await readManagerMeta(paths);
@@ -949,8 +919,7 @@ async function enrichAll(ctx: ExtensionContext, paths: Paths, refresh: boolean):
 			const lookup = lookupModel(handle.index, providerId, model.id);
 			if (lookup === undefined) continue;
 			const enrichment = enrichFromModelsDev(model, lookup, false);
-			if (enrichment.filled.length === 0) continue;
-			Object.assign(model, enrichment.patch);
+				Object.assign(model, enrichment.patch);
 			const key = modelMetaKey(providerId, model.id);
 			meta.models[key] = { ...meta.models[key], ...enrichment.meta };
 			models++;
@@ -960,9 +929,8 @@ async function enrichAll(ctx: ExtensionContext, paths: Paths, refresh: boolean):
 		ctx.ui.notify("没有需要从 models.dev 补全的信息", "info");
 		return;
 	}
-	if (!(await save(ctx, paths, file))) return;
-	await writeManagerMeta(paths, meta);
-	ctx.ui.notify(`已用 models.dev 补全 ${models} 个模型`, "info");
+	if (!(await save(ctx, paths, file, { meta }))) return;
+	ctx.ui.notify(`已用 models.dev 参考信息补全 ${models} 个模型`, "info");
 }
 
 // ---------------------------------------------------------------------------
@@ -973,34 +941,17 @@ async function addDiscoveredModels(ctx: ExtensionContext, paths: Paths, provider
 	const file = await reloadModels(paths);
 	const provider = findProvider(file, providerId);
 	if (provider === undefined) return;
-	const handle = await withCatalog(ctx, paths, false, `添加模型 · 读取 models.dev`);
+	const handle = await withCatalog(ctx, paths, false, `添加模型，读取 models.dev`);
 	const meta = await readManagerMeta(paths);
 
-	const existing = new Set(providerModels(provider).map((model) => model.id));
-	let added = 0;
-	let withoutMetadata = 0;
-	for (const entry of discovered) {
-		if (existing.has(entry.id)) continue;
-		const model = toManagedModel(entry);
-		const lookup = lookupModel(handle.index, providerId, entry.id);
-		const enrichment = enrichFromModelsDev(model, lookup, false);
-		Object.assign(model, enrichment.patch);
-		if (lookup !== undefined) {
-			const key = modelMetaKey(providerId, entry.id);
-			meta.models[key] = { ...meta.models[key], ...enrichment.meta, source: "endpoint" };
-		}
-		if (model.name === undefined || model.name === "") model.name = entry.id;
-		if (model.contextWindow === undefined || model.maxTokens === undefined) withoutMetadata++;
-		provider.models = [...providerModels(provider), model];
-		existing.add(entry.id);
-		added++;
-	}
+	if (handle.error) ctx.ui.notify(handle.error, "warning");
+	const { models, added, withoutMetadata } = mergeDiscoveredModels(providerId, providerModels(provider), meta, discovered, handle.index);
+	provider.models = models;
 	if (added === 0) {
 		ctx.ui.notify("没有新模型可添加", "info");
 		return;
 	}
-	if (!(await save(ctx, paths, file))) return;
-	await writeManagerMeta(paths, meta);
+	if (!(await save(ctx, paths, file, { meta }))) return;
 	ctx.ui.notify(
 		`已添加 ${added} 个模型到 "${providerId}"${withoutMetadata > 0 ? `。其中 ${withoutMetadata} 个缺少上下文/最大输出信息，建议用 models.dev 补全或手动编辑` : ""}`,
 		withoutMetadata > 0 ? "warning" : "info",
@@ -1013,11 +964,14 @@ async function fetchModels(ctx: ExtensionContext, paths: Paths, providerId: stri
 	if (initialProvider === undefined) return;
 
 	// 1/2 请求端点（只请求一次，后面选模型不再重复发请求）
-	ctx.ui.setStatus(STATUS_KEY, `获取模型 1/2 · 正在请求 ${providerId} 的端点…`);
+	ctx.ui.setStatus(STATUS_KEY, `获取模型 1/2，正在请求 ${providerId} 的端点`);
 	let discovered: DiscoveredModel[];
 	let url: string;
+	let discovery: DiscoveryResult;
 	try {
-		const result = await discoverModels(ctx, providerId, initialProvider);
+		const result = await withProgress(ctx, `获取 ${providerId} 的模型列表`, signal => discoverModels(ctx, providerId, initialProvider, signal));
+		discovery = result;
+		for (const warning of result.warnings) ctx.ui.notify(warning, "warning");
 		discovered = result.models;
 		url = result.url;
 	} catch (error) {
@@ -1027,6 +981,7 @@ async function fetchModels(ctx: ExtensionContext, paths: Paths, providerId: stri
 		ctx.ui.setStatus(STATUS_KEY, undefined);
 	}
 	const remoteIds = new Set(discovered.map((model) => model.id));
+	const pickerState: PickState = {};
 
 	// 2/2 展示模型列表
 	while (true) {
@@ -1035,32 +990,33 @@ async function fetchModels(ctx: ExtensionContext, paths: Paths, providerId: stri
 		if (provider === undefined) return;
 		const configured = new Map(providerModels(provider).map((model) => [model.id, model]));
 		const missing = discovered.filter((model) => !configured.has(model.id));
-		const orphaned = [...configured.keys()].filter((id) => !remoteIds.has(id));
-		const title = `${providerId} 端点返回 ${discovered.length} 个模型（已配置 ${configured.size} 个）· ${url}`;
+		const orphaned = discovery.complete ? [...configured.keys()].filter((id) => !remoteIds.has(id)) : [];
+		const title = `${discovery.complete ? "" : "列表不完整，仅支持添加。"}${providerId} 端点返回 ${discovered.length} 个模型（已配置 ${configured.size} 个），${url}`;
 
 		// TUI：直接把端点返回的模型列出来，逐个挑或批量加
 		if (canPick(ctx)) {
 			const items: PickItem[] = discovered.map((model) => ({
-				value: model.id,
-				label: `${configured.has(model.id) ? "✓" : "＋"} ${model.id}`,
+				value: `::remote:${model.id}`,
+				label: model.id,
 				description: discoveredDescription(model, configured.has(model.id)),
 			}));
 			for (const id of orphaned) {
-				items.push({ value: `::local:${id}`, label: `⚠ ${id}`, description: "端点未提供，本地保留" });
+				items.push({ value: `::local:${id}`, label: `提示：${id}`, description: "本地保留，端点未提供" });
 			}
 			if (missing.length > 0) {
-				items.push({ value: "::all", label: `＋ 添加全部 ${missing.length} 个未配置模型`, description: "一次写入 models.json" });
+				items.push({ value: "::all", label: `添加全部 ${missing.length} 个未配置模型`, description: "一次写入 models.json" });
 			}
-			if (missing.length > 0 || orphaned.length > 0) {
+			if (discovery.complete) {
 				items.push({
 					value: "::sync",
-					label: `↻ 同步：添加 ${missing.length} 个，移除 ${orphaned.length} 个`,
-					description: "让本地列表和端点完全一致",
+					label: `同步模型（新增 ${missing.length} 个，移除 ${orphaned.length} 个）`,
+					description: "预览并同步模型及端点参数",
 				});
 			}
 			const picked = await pickList(ctx, title, items, {
 				maxVisible: 16,
-				footer: "输入关键字筛选 · ↑↓ 选择 · Enter 添加 · Esc 返回",
+				state: pickerState,
+				footer: "输入关键字筛选，上下键 选择，Enter 添加，Esc 返回",
 			});
 			if (picked === undefined) return;
 			try {
@@ -1073,15 +1029,15 @@ async function fetchModels(ctx: ExtensionContext, paths: Paths, providerId: stri
 					return;
 				}
 				if (picked === "::sync") {
-					await syncEndpoint(ctx, paths, providerId, discovered);
+					await syncEndpoint(ctx, paths, providerId, discovery);
 					return;
 				}
 				// 选单个模型：加完留在列表里，方便接着挑
-				const model = discovered.find((entry) => entry.id === picked);
+				const model = discovered.find((entry) => `::remote:${entry.id}` === picked);
 				if (model !== undefined && !configured.has(model.id)) {
 					await addDiscoveredModels(ctx, paths, providerId, [model]);
 				} else {
-					ctx.ui.notify(`"${picked}" 已经配置过了`, "info");
+					ctx.ui.notify(`该模型已经配置过了`, "info");
 				}
 				continue;
 			} catch (error) {
@@ -1091,13 +1047,13 @@ async function fetchModels(ctx: ExtensionContext, paths: Paths, providerId: stri
 		}
 
 		// 非 TUI（RPC / print）降级：只能给出批量选项
-		const answer = await choose<string>(ctx, `获取模型 2/2 · ${title}`, [
-			{ label: `＋ 添加 ${missing.length} 个新模型`, value: "add", disabled: missing.length === 0 },
-			{ label: "选择要添加的模型…", value: "pick", disabled: missing.length === 0 },
+		const answer = await choose<string>(ctx, `获取模型 2/2，${title}`, [
+			{ label: `添加 ${missing.length} 个新模型`, value: "add", disabled: missing.length === 0 },
+			{ label: "选择要添加的模型", value: "pick", disabled: missing.length === 0 },
 			{
-				label: `↻ 添加新模型，并移除 ${orphaned.length} 个端点已不再提供的模型`,
+				label: `添加新模型，并移除 ${orphaned.length} 个端点已不再提供的模型`,
 				value: "replace",
-				disabled: missing.length === 0 && orphaned.length === 0,
+				disabled: !discovery.complete,
 			},
 			{ label: BACK, value: "back" },
 		]);
@@ -1109,12 +1065,12 @@ async function fetchModels(ctx: ExtensionContext, paths: Paths, providerId: stri
 				return;
 			}
 			if (answer === "replace") {
-				await syncEndpoint(ctx, paths, providerId, discovered);
+				await syncEndpoint(ctx, paths, providerId, discovery);
 				return;
 			}
 			if (answer === "pick") {
 				const picked = await choose(ctx, `添加哪个模型到 ${providerId}？`, [
-					...missing.map((model) => ({ label: model.name === undefined ? model.id : `${model.id} — ${model.name}`, value: model.id })),
+					...missing.map((model) => ({ label: model.name === undefined ? model.id : `${model.id}：${model.name}`, value: model.id })),
 					{ label: BACK, value: "__back" },
 				]);
 				if (isCancelled(picked) || picked === "__back") return;
@@ -1128,32 +1084,30 @@ async function fetchModels(ctx: ExtensionContext, paths: Paths, providerId: stri
 	}
 }
 
-/** 让本地模型列表和端点完全一致：先确认删除多余的，再把新的加进去。 */
-async function syncEndpoint(ctx: ExtensionContext, paths: Paths, providerId: string, discovered: DiscoveredModel[]): Promise<void> {
-	const remote = new Set(discovered.map((model) => model.id));
+/** Confirm the complete diff, then commit additions/removals/metadata together. */
+async function syncEndpoint(ctx: ExtensionContext, paths: Paths, providerId: string, discovery: DiscoveryResult): Promise<void> {
+	if (!discovery.complete) { ctx.ui.notify("模型列表不完整，不能同步删除本地模型", "warning"); return; }
 	const file = await reloadModels(paths);
 	const provider = findProvider(file, providerId);
 	if (provider === undefined) return;
-	const orphaned = providerModels(provider)
-		.map((model) => model.id)
-		.filter((id) => !remote.has(id));
-
-	if (orphaned.length > 0) {
-		const confirmed = await ctx.ui.confirm(
-			`移除 ${orphaned.length} 个模型（provider "${providerId}"）？`,
-			`将移除：${orphaned.slice(0, 12).join(", ")}${orphaned.length > 12 ? " 等" : ""}`,
-		);
-		if (!confirmed) return;
-	}
-
-	provider.models = providerModels(provider).filter((model) => remote.has(model.id));
-	if (!(await save(ctx, paths, file))) return;
+	const handle = await withCatalog(ctx, paths, false, "同步模型：读取 models.dev");
+	if (handle.error) ctx.ui.notify(handle.error, "warning");
 	const meta = await readManagerMeta(paths);
-	for (const id of orphaned) delete meta.models[modelMetaKey(providerId, id)];
-	await writeManagerMeta(paths, meta);
-
-	const kept = new Set(providerModels(provider).map((model) => model.id));
-	await addDiscoveredModels(ctx, paths, providerId, discovered.filter((model) => !kept.has(model.id)));
+	const result = mergeDiscoveredModels(providerId, providerModels(provider), meta, discovery.models, handle.index, true);
+	const oldIds = new Set(providerModels(provider).map(model => model.id));
+	const addedIds = result.models.filter(model => !oldIds.has(model.id)).map(model => model.id);
+	const updatedIds = result.models.filter(model => {
+		const old = findModel(provider, model.id);
+		return old && JSON.stringify(old) !== JSON.stringify(model);
+	}).map(model => model.id);
+	const preview = (ids: string[]) => ids.length ? `${ids.slice(0, 12).join(", ")}${ids.length > 12 ? " 等" : ""}` : "无";
+	const confirmed = await ctx.ui.confirm(
+		`同步 ${providerId} 的模型？`,
+		`新增 ${result.added} 个：${preview(addedIds)}\n移除 ${result.removed.length} 个：${preview(result.removed)}\n更新 ${updatedIds.length} 个：${preview(updatedIds)}\nmodels.dev 信息仅供参考，请核对中转站价格和限制。`,
+	);
+	if (!confirmed) return;
+	provider.models = result.models;
+	if (await save(ctx, paths, file, { meta })) ctx.ui.notify(`同步完成：新增 ${result.added} 个，移除 ${result.removed.length} 个，更新 ${updatedIds.length} 个`, "info");
 }
 
 // ---------------------------------------------------------------------------
@@ -1179,7 +1133,7 @@ async function addModelManually(ctx: ExtensionContext, paths: Paths, providerId:
 			label: "模型 id",
 			run: async (c, d, progress) => {
 				while (true) {
-					const answer = await askText(c, `${progress} · 模型 id（要和端点上的写法一致）`, "例如 claude-sonnet-4-5");
+					const answer = await askText(c, `${progress}，模型 id（要和端点上的写法一致）`, "例如 claude-sonnet-4-5");
 					if (isCancelled(answer) || answer === "") return false;
 					const current = await reloadModels(paths);
 					const currentProvider = findProvider(current, providerId);
@@ -1192,11 +1146,11 @@ async function addModelManually(ctx: ExtensionContext, paths: Paths, providerId:
 					d.model = { id: answer };
 					d.auto = new Set();
 					d.meta = undefined;
-					const handle = await withCatalog(c, paths, false, "添加模型 · 读取 models.dev");
+					const handle = await withCatalog(c, paths, false, "添加模型，读取 models.dev");
 					if (handle.error !== undefined) c.ui.notify(handle.error, "warning");
 					const lookup = lookupModel(handle.index, providerId, answer);
 					if (lookup === undefined) {
-						c.ui.notify(`models.dev 中找不到 "${answer}"，请手动填写信息`, "warning");
+						c.ui.notify(`models.dev 中找不到唯一匹配的 "${answer}"，请手动填写信息`, "warning");
 					} else {
 						const enrichment = enrichFromModelsDev(d.model, lookup, false);
 						Object.assign(d.model, enrichment.patch);
@@ -1211,7 +1165,7 @@ async function addModelManually(ctx: ExtensionContext, paths: Paths, providerId:
 			label: "显示名",
 			skip: (d) => d.auto.has("name"),
 			run: async (c, d, progress) => {
-				const answer = await askText(c, `${progress} · 显示名`, d.model.name ?? d.id);
+				const answer = await askText(c, `${progress}，显示名`, d.model.name ?? d.id);
 				if (isCancelled(answer)) return false;
 				d.model.name = answer === "" ? d.id : answer;
 				return true;
@@ -1221,7 +1175,7 @@ async function addModelManually(ctx: ExtensionContext, paths: Paths, providerId:
 			label: "上下文窗口",
 			skip: (d) => d.auto.has("contextWindow"),
 			run: async (c, d, progress) => {
-				const value = await askNumber(c, `${progress} · 上下文窗口（tokens，留空不设）`, d.model.contextWindow ?? 128000);
+				const value = await askNumber(c, `${progress}，上下文窗口（tokens，留空不设）`, d.model.contextWindow ?? 128000);
 				if (value.kind === "cancel") return false;
 				if (value.kind === "value") d.model.contextWindow = value.value;
 				else delete d.model.contextWindow;
@@ -1232,7 +1186,7 @@ async function addModelManually(ctx: ExtensionContext, paths: Paths, providerId:
 			label: "最大输出 tokens",
 			skip: (d) => d.auto.has("maxTokens"),
 			run: async (c, d, progress) => {
-				const value = await askNumber(c, `${progress} · 最大输出 tokens（留空不设）`, d.model.maxTokens ?? 16384);
+				const value = await askNumber(c, `${progress}，最大输出 tokens（留空不设）`, d.model.maxTokens ?? 16384);
 				if (value.kind === "cancel") return false;
 				if (value.kind === "value") d.model.maxTokens = value.value;
 				else delete d.model.maxTokens;
@@ -1243,7 +1197,7 @@ async function addModelManually(ctx: ExtensionContext, paths: Paths, providerId:
 			label: "是否支持推理",
 			skip: (d) => d.auto.has("reasoning"),
 			run: async (c, d, progress) => {
-				const value = await askYesNo(c, `${progress} · 是否支持推理 / thinking`, d.model.reasoning ?? false);
+				const value = await askYesNo(c, `${progress}，是否支持推理 / thinking`, d.model.reasoning ?? false);
 				if (isCancelled(value)) return false;
 				d.model.reasoning = value;
 				return true;
@@ -1258,14 +1212,12 @@ async function addModelManually(ctx: ExtensionContext, paths: Paths, providerId:
 	const provider = findProvider(file, providerId);
 	if (provider === undefined) return;
 	provider.models = [...providerModels(provider), result.model];
-	if (!(await save(ctx, paths, file))) return;
-
+	const meta = await readManagerMeta(paths);
 	if (result.meta !== undefined) {
-		const meta = await readManagerMeta(paths);
 		const key = modelMetaKey(providerId, result.id);
-		meta.models[key] = { ...meta.models[key], ...result.meta, source: "manual" };
-		await writeManagerMeta(paths, meta);
+		meta.models[key] = { ...meta.models[key], ...result.meta };
 	}
+	if (!(await save(ctx, paths, file, { meta }))) return;
 	ctx.ui.notify(`已添加模型 "${result.id}" 到 "${providerId}"`, "info");
 }
 
@@ -1287,14 +1239,14 @@ async function testProvider(ctx: ExtensionContext, paths: Paths, providerId: str
 	if (canPick(ctx)) {
 		modelId = await pickList(
 			ctx,
-			`测试连接 1/2 · 用哪个模型测试 ${providerId}？`,
+			`测试连接 1/2，用哪个模型测试 ${providerId}？`,
 			models.map((model) => ({ value: model.id, label: model.id, description: modelDescription(model, undefined) })),
-			{ maxVisible: 16, footer: "输入关键字筛选 · ↑↓ 选择 · Enter 测试 · Esc 取消" },
+			{ maxVisible: 16, footer: "输入关键字筛选，上下键 选择，Enter 测试，Esc 取消" },
 		);
 	} else {
 		const picked = await choose(
 			ctx,
-			`测试连接 1/2 · 用哪个模型测试 ${providerId}？`,
+			`测试连接 1/2，用哪个模型测试 ${providerId}？`,
 			models.map((model) => ({ label: modelLabel(model, undefined), value: model.id })),
 		);
 		modelId = isCancelled(picked) ? undefined : picked;
@@ -1309,15 +1261,17 @@ async function testProvider(ctx: ExtensionContext, paths: Paths, providerId: str
 
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), 120_000);
-	ctx.ui.setStatus(STATUS_KEY, `测试连接 2/2 · 正在请求 ${providerId}/${modelId}…`);
+	ctx.ui.setStatus(STATUS_KEY, `测试连接 2/2，正在请求 ${providerId}/${modelId}`);
 	const startedAt = Date.now();
 	try {
-		const stream = ctx.modelRegistry.streamSimple(
-			model,
-			{ messages: [{ role: "user", content: "Reply with the single word: OK", timestamp: Date.now() }] },
-			{ maxTokens: 64, signal: controller.signal },
-		);
-		const result = await stream.result();
+		const result = await withProgress(ctx, `测试 ${providerId}/${modelId}`, async signal => {
+			const stream = ctx.modelRegistry.streamSimple(
+				model,
+				{ messages: [{ role: "user", content: "Reply with the single word: OK", timestamp: Date.now() }] },
+				{ maxTokens: 64, signal: AbortSignal.any([signal, controller.signal]) },
+			);
+			return stream.result();
+		});
 		const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
 		if (result.stopReason === "error") throw new Error(result.errorMessage ?? "provider 返回错误");
 		if (result.stopReason === "aborted") throw new Error("请求已中止");
@@ -1327,11 +1281,11 @@ async function testProvider(ctx: ExtensionContext, paths: Paths, providerId: str
 			.join(" ")
 			.trim();
 		ctx.ui.notify(
-			`✓ 测试连接成功 · ${providerId}/${modelId} 耗时 ${elapsed}s · 输入 ${result.usage.input} / 输出 ${result.usage.output} tokens${text === "" ? "" : ` · "${truncate(text, 60)}"`}`,
+			`测试连接成功，${providerId}/${modelId} 耗时 ${elapsed}s，输入 ${result.usage.input} / 输出 ${result.usage.output} tokens${text === "" ? "" : `，"${truncate(text, 60)}"`}`,
 			"info",
 		);
 	} catch (error) {
-		notifyError(ctx, new Error(`✗ 测试连接失败 · ${providerId}/${modelId}：${error instanceof Error ? error.message : String(error)}`));
+		notifyError(ctx, new Error(`测试连接失败，${providerId}/${modelId}：${error instanceof Error ? error.message : String(error)}`));
 	} finally {
 		clearTimeout(timeout);
 		ctx.ui.setStatus(STATUS_KEY, undefined);

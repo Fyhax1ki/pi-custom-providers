@@ -84,3 +84,10 @@ export function isCancelled<T>(answer: Answer<T>): answer is typeof CANCELLED {
 export function modelMetaKey(providerId: string, modelId: string): string {
 	return `${providerId}/${modelId}`;
 }
+
+export type NumericModelField = "contextWindow" | "maxTokens";
+
+export function setModelNumber(model: ManagedModel, field: NumericModelField, value: number | undefined): void {
+	if (value === undefined) delete model[field];
+	else model[field] = value;
+}

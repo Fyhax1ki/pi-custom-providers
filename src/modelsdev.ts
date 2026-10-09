@@ -10,8 +10,8 @@
  * offline once it has been downloaded.
  */
 
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { readFile, stat } from "node:fs/promises";
+import { atomicWrite } from "./file-io.ts";
 import type { ManagedModel, ModelInput, ModelMeta } from "./types.ts";
 import type { Paths } from "./store.ts";
 import { isObject } from "./store.ts";
@@ -62,7 +62,8 @@ export interface LookupResult {
 }
 
 export interface CatalogIndex {
-	byKey: Map<string, LookupResult>;
+	exact: Map<string, LookupResult[]>;
+	byKey: Map<string, LookupResult[]>;
 }
 
 export interface CatalogHandle {
@@ -92,8 +93,7 @@ function normalizeKey(value: string): string {
 		.replace(/[^a-z0-9-]+/g, "-")
 		.replace(/-+/g, "-")
 		.replace(/^-|-$/g, "")
-		.replace(/-latest$/, "")
-		.replace(/-\d{4}-?\d{2}-?\d{2}$/, "");
+		.replace(/-latest$/, "");
 }
 
 function bareId(id: string): string {
@@ -121,10 +121,7 @@ async function readCache(paths: Paths): Promise<CacheFile | undefined> {
 
 async function writeCache(paths: Paths, cache: CacheFile): Promise<void> {
 	try {
-		await mkdir(dirname(paths.modelsDevCachePath), { recursive: true });
-		const temp = `${paths.modelsDevCachePath}.${process.pid}.tmp`;
-		await writeFile(temp, `${JSON.stringify(cache)}\n`, "utf8");
-		await rename(temp, paths.modelsDevCachePath);
+		await atomicWrite(paths.modelsDevCachePath, `${JSON.stringify(cache)}\n`);
 	} catch {
 		// A cache write failure must never break enrichment.
 	}
@@ -150,7 +147,7 @@ async function fetchCatalog(signal?: AbortSignal): Promise<ModelsDevCatalog> {
  * `refresh` forces a network fetch. Otherwise a cached copy is used until it
  * expires. A network failure always falls back to the cache when one exists.
  */
-export async function loadCatalog(
+async function loadCatalogUncached(
 	paths: Paths,
 	options: { refresh?: boolean; signal?: AbortSignal } = {},
 ): Promise<CatalogHandle> {
@@ -182,6 +179,7 @@ export async function loadCatalog(
 		await writeCache(paths, { fetchedAt, catalog });
 		return { catalog, index: buildIndex(catalog), fetchedAt, source: "network", stale: false };
 	} catch (error) {
+		options.signal?.throwIfAborted();
 		const message = error instanceof Error ? error.message : String(error);
 		if (cached !== undefined) {
 			return {
@@ -197,47 +195,78 @@ export async function loadCatalog(
 	}
 }
 
+const memoryCache = new Map<string, { signature: string; offline: boolean; retryAt: number; handle: CatalogHandle }>();
+const pending = new Map<string, Promise<CatalogHandle>>();
+
+async function cacheSignature(path: string): Promise<string> {
+	return stat(path).then(s => `${s.mtimeMs}:${s.size}`, () => "missing");
+}
+
+export async function loadCatalog(paths: Paths, options: { refresh?: boolean; signal?: AbortSignal } = {}): Promise<CatalogHandle> {
+	options.signal?.throwIfAborted();
+	const path = paths.modelsDevCachePath;
+	const offline = Boolean(process.env.PI_OFFLINE);
+	const signature = await cacheSignature(path);
+	const memory = memoryCache.get(path);
+	if (!options.refresh && memory?.signature === signature && memory.offline === offline && Date.now() < memory.retryAt) return memory.handle;
+	if (!options.signal && !options.refresh && pending.has(path)) return pending.get(path)!;
+	const task = loadCatalogUncached(paths, options).then(async handle => {
+		const retryAt = handle.stale ? Date.now() + 60_000 : (handle.fetchedAt ?? Date.now()) + CACHE_TTL_MS;
+		memoryCache.set(path, { signature: await cacheSignature(path), offline, retryAt, handle });
+		return handle;
+	});
+	if (!options.signal && !options.refresh) pending.set(path, task);
+	try { return await task; }
+	finally { if (pending.get(path) === task) pending.delete(path); }
+}
+
 // ---------------------------------------------------------------------------
 // Lookup
 // ---------------------------------------------------------------------------
 
 export function buildIndex(catalog: ModelsDevCatalog): CatalogIndex {
-	const byKey = new Map<string, LookupResult>();
-	const add = (key: string, result: LookupResult) => {
-		if (key !== "" && !byKey.has(key)) byKey.set(key, result);
+	const exact = new Map<string, LookupResult[]>();
+	const byKey = new Map<string, LookupResult[]>();
+	const add = (map: Map<string, LookupResult[]>, key: string, result: LookupResult) => {
+		if (!key) return;
+		const entries = map.get(key) ?? [];
+		if (!entries.includes(result)) entries.push(result);
+		map.set(key, entries);
 	};
 	for (const [providerId, provider] of Object.entries(catalog)) {
-		if (!isObject(provider.models)) continue;
+		if (!isObject(provider) || !isObject(provider.models)) continue;
 		for (const [modelId, rawModel] of Object.entries(provider.models)) {
 			if (!isObject(rawModel)) continue;
-			const raw = rawModel as ModelsDevModel;
-			const id = typeof raw.id === "string" && raw.id !== "" ? raw.id : modelId;
-			const result: LookupResult = { providerId, model: { ...raw, id } };
-			const candidates = [id, bareId(id), result.model.canonical_model_id, result.model.name];
-			for (const candidate of candidates) {
-				if (typeof candidate !== "string" || candidate === "") continue;
-				add(`${normalizeKey(providerId)}/${normalizeKey(candidate)}`, result);
+			const id = typeof rawModel.id === "string" && rawModel.id !== "" ? rawModel.id : modelId;
+			const raw: ModelsDevModel = { ...rawModel, id };
+			const result = { providerId, model: { ...raw, id } };
+			for (const candidate of new Set([id, modelId])) {
+				add(exact, `${providerId}/${candidate}`, result);
+				add(exact, candidate, result);
 			}
-			// Global (provider-less) keys, so a relay id can find its upstream model.
-			for (const candidate of candidates) {
+			for (const candidate of [id, bareId(id), raw.canonical_model_id, raw.name]) {
 				if (typeof candidate !== "string" || candidate === "") continue;
-				add(normalizeKey(candidate), result);
+				add(byKey, `${normalizeKey(providerId)}/${normalizeKey(candidate)}`, result);
+				add(byKey, normalizeKey(candidate), result);
 			}
 		}
 	}
-	return { byKey };
+	return { exact, byKey };
 }
 
+/** Exact matches win. Ambiguity is not resolved by catalog insertion order. */
 export function lookupModel(index: CatalogIndex, providerId: string | undefined, modelId: string): LookupResult | undefined {
-	const keys: string[] = [];
-	if (providerId !== undefined) {
-		keys.push(`${normalizeKey(providerId)}/${normalizeKey(modelId)}`);
+	const exactKeys = providerId ? [`${providerId}/${modelId}`, modelId] : [modelId];
+	for (const key of exactKeys) {
+		const hits = index.exact.get(key);
+		if (hits) return hits.length === 1 ? hits[0] : undefined;
 	}
+	const keys = providerId ? [`${normalizeKey(providerId)}/${normalizeKey(modelId)}`] : [];
 	keys.push(normalizeKey(modelId));
 	if (modelId.includes("/")) keys.push(normalizeKey(bareId(modelId)));
 	for (const key of keys) {
-		const hit = index.byKey.get(key);
-		if (hit !== undefined) return hit;
+		const hits = index.byKey.get(key);
+		if (hits) return hits.length === 1 ? hits[0] : undefined;
 	}
 	return undefined;
 }
@@ -256,6 +285,10 @@ function modalityInput(modalities: ModelsDevModel["modalities"]): ModelInput[] |
 
 function positive(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function nonnegative(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
 export interface Enrichment {
@@ -295,10 +328,10 @@ export function enrichFromModelsDev(model: ManagedModel, lookup: LookupResult | 
 	if (input !== undefined) set("input", input);
 	const cost = source.cost;
 	if (isObject(cost)) {
-		const input_ = positive(cost.input);
-		const output = positive(cost.output);
-		const cacheRead = typeof cost.cache_read === "number" && cost.cache_read >= 0 ? cost.cache_read : undefined;
-		const cacheWrite = typeof cost.cache_write === "number" && cost.cache_write >= 0 ? cost.cache_write : undefined;
+		const input_ = nonnegative(cost.input);
+		const output = nonnegative(cost.output);
+		const cacheRead = nonnegative(cost.cache_read);
+		const cacheWrite = nonnegative(cost.cache_write);
 		if (input_ !== undefined && output !== undefined) {
 			const existing = isObject(model.cost) ? model.cost : undefined;
 			const next = {
